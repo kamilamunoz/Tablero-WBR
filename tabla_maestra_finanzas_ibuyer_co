@@ -1,0 +1,571 @@
+
+---------------------------------------- SELLERS MÉXICO ----------------------------------------
+
+-- Se crea la base donde se trae la base de fechas y NID, en este caso es importante entender que la entrada es la fecha de promesa y la salida puede ser la escritura o el desistimiento
+-- por esta razón un NID no va a estar constantemente en backlog y pueda entrar y salir de este cuantás veces exista una nueva negociación sobre el.
+
+-- NOTAS IMPORTANTES:
+-- 1. La idea para consumir esta tabla es poder tener el detalle de los NID que estuvieron en cada una de las etapas por mes, para el caso de Sellers es importante hacer una 
+-- diferenciación entre cierre y precierre, esto va a ser una columna que se va a poder filtrar al comento de consumirla.
+-- 2. Las columnas importantes serán el mes (ya que nos dejará filtrar los periodos de tiempo) y el nid porque de ahí traeremos el detalle, sim ebargo, también estará en las columnas
+-- importantes donde se repetira cuantas veces sea necesario para conocer su paso por cada una de las etapas.
+-- 3. También ebemos considerar si poner el area_metropolitana por si en algún momento en el futuro se quiere filtrar por ciudades. 
+
+-- FUENTE: `papyrus-master.operations_sellers_mx_dwh.sellers_cierres_y_precierres_mx_dwh`
+
+    WITH
+
+    fechas AS (
+       SELECT 
+        b.mes AS month,
+        bi.nid,
+        bi.v_tipo_compra_sellers,
+        o.c_habicredit_100,
+        FROM (
+          SELECT
+          nid,
+          DATE(v_mes_dia_pre_cierre_y_cierre) AS v_fecha_promesa,
+          DATE(v_fecha_desistimiento) AS v_fecha_desistidos_sellers,
+          DATE(v_fecha_poder_escritura) AS v_fecha_escritura,
+          CASE
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre (documentos completos)'     THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'pre cierre (documentación mínima)' THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 's - escritura e ine correctos'     THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre incompleto'                 THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'pre-cierre'                        THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre completo'                   THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'carta oferta - sin contratos'      THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'l - documentos completos'          THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'l - contratos completos'           THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen IS NULL AND v_tipo_de_cierre_tarifa IS NULL THEN 'cierre'
+            WHEN v_tipo_de_tarifa_dictamen IS NULL AND v_tipo_de_cierre_tarifa IS NOT NULL THEN    
+                CASE
+                  WHEN v_tipo_de_cierre_tarifa='cierre (documentos completos)'     THEN 'cierre'
+                  WHEN v_tipo_de_cierre_tarifa='pre cierre (documentación mínima)' THEN 'precierre'
+                  WHEN v_tipo_de_cierre_tarifa='pre cierre'                        THEN 'precierre' 
+                END
+          END AS v_tipo_compra_sellers,
+          FROM `papyrus-master.operations_sellers_mx_dwh.sellers_cierres_y_precierres_mx_dwh`
+        ) AS bi
+        
+        CROSS JOIN (
+          SELECT
+          DATE_TRUNC(f.fecha,MONTH) AS mes,
+          f.fecha,
+          FROM `papyrus-data.habi_wh.fechas` AS f
+        ) AS b
+
+        LEFT JOIN `papyrus-master.dm_habi_mx_dwh_bi.operacion_general_mx_bi` AS o ON o.nid=bi.nid
+
+        WHERE b.mes >= DATE_tRUNC(bi.v_fecha_promesa,MONTH)
+          AND b.mes <= DATE_TRUNC(IFNULL(o.c_fecha_titulacion,CURRENT_DATE()),MONTH)
+        -- AND bi.nid=8950918157
+        GROUP BY 1,2,3,4
+    ),
+    
+    base AS (
+      SELECT 
+        b.fecha,
+        b.mes,
+        bi.nid,
+        bi.v_fecha_promesa,
+        bi.v_fecha_desistidos_sellers,
+        bi.v_fecha_escritura,
+        bi.v_tipo_compra_sellers,
+        SAFE_CAST(o.fecha_primer_publicacion AS DATE) AS fecha_primer_publicacion,
+        -- o.c_fecha_titulacion,
+        # Empezamos traer las entradas de los negocios al inventario y la lógica que se aplica es la siguiente:
+        -- 1. Que la v_fecha_promesa sea mayor o igual a la fecha_base
+        -- 2. Que si la fecha_base sea menor que v_fecha_escritura o v_fecha_desistimiento o la fecha actual de no existir las dos anteriores.
+        -- Se hace un COALESCE porque debemos priorizar la escritura pero entendiendo que solo podemos escriturar una vez, pero se puede desistir muchas veces.
+        -- Entonces se prioriza la escritura pero si existe un desistimiento pues este nos indicará la primera salida y si no hay ninguna de estaás la fecha actual nos indica que sigue en backlog. 
+        IF(b.fecha >= bi.v_fecha_promesa
+            AND b.fecha <= COALESCE(bi.v_fecha_escritura, bi.v_fecha_desistidos_sellers, CURRENT_DATE())
+          , 'inventario promesa a escritura: total'
+          , NULL
+          ) AS v_inventario_p_e,
+
+        IF(b.fecha >= bi.v_fecha_promesa
+            AND b.fecha < COALESCE(bi.v_fecha_escritura, bi.v_fecha_desistidos_sellers, CURRENT_DATE())
+            AND bi.v_tipo_compra_sellers = 'Tradicional'
+          , 'inventario promesa a escritura: total alianzas'
+          , NULL
+          ) AS v_inventario_p_e_tradicional,
+
+        IF(b.fecha >= bi.v_fecha_promesa
+            AND b.fecha < COALESCE(bi.v_fecha_escritura, bi.v_fecha_desistidos_sellers, CURRENT_DATE())
+            AND bi.v_tipo_compra_sellers = 'Alianza'
+          , 'inventario promesa a escritura: total alianzas'
+          , NULL
+          ) AS v_inventario_p_e_alianzas,
+
+        IF (b.fecha >= bi.v_fecha_escritura
+            AND b.fecha <= COALESCE(SAFE_CAST(o.fecha_primer_publicacion AS DATE),CURRENT_DATE())
+            ,'inventario escritura a publicacion: total'
+            , NULL) AS v_inventario_e_p
+
+        FROM (
+          SELECT
+          nid,
+          DATE(v_mes_dia_pre_cierre_y_cierre) AS v_fecha_promesa,
+          DATE(v_fecha_desistimiento) AS v_fecha_desistidos_sellers,
+          DATE(v_fecha_poder_escritura) AS v_fecha_escritura,
+          CASE
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre (documentos completos)'     THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'pre cierre (documentación mínima)' THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 's - escritura e ine correctos'     THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre incompleto'                 THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'pre-cierre'                        THEN  'precierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'cierre completo'                   THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'carta oferta - sin contratos'      THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'l - documentos completos'          THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen = 'l - contratos completos'           THEN  'cierre'  --  
+            WHEN v_tipo_de_tarifa_dictamen IS NULL AND v_tipo_de_cierre_tarifa IS NULL THEN 'cierre'
+            WHEN v_tipo_de_tarifa_dictamen IS NULL AND v_tipo_de_cierre_tarifa IS NOT NULL THEN    
+                CASE
+                  WHEN v_tipo_de_cierre_tarifa='cierre (documentos completos)'     THEN 'cierre'
+                  WHEN v_tipo_de_cierre_tarifa='pre cierre (documentación mínima)' THEN 'precierre'
+                  WHEN v_tipo_de_cierre_tarifa='pre cierre'                        THEN 'precierre' 
+                END
+          END AS v_tipo_compra_sellers,
+          FROM `papyrus-master.operations_sellers_mx_dwh.sellers_cierres_y_precierres_mx_dwh`
+        ) AS bi
+        
+        CROSS JOIN (
+          SELECT
+          DATE_TRUNC(f.fecha,MONTH) AS mes,
+          f.fecha,
+
+          FROM `papyrus-data.habi_wh.fechas` AS f
+        ) AS b
+
+        LEFT JOIN (
+          SELECT
+          SAFE_CAST(nid AS INTEGER) AS nid, 
+          CASE 
+            WHEN fecha_primer_publicacion > 
+              (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END) THEN (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END)
+            WHEN fecha_primer_publicacion <= 
+              (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END) THEN fecha_primer_publicacion
+            ELSE fecha_primer_publicacion
+          END AS fecha_primer_publicacion,
+          FROM `papyrus-delivery-data.corp_gov_global.base_inventario_corpfin` 
+          WHERE pais='México'
+        ) AS o ON o.nid=bi.nid
+    )
+
+  -- , final_inventarios_v_p_e AS (
+  --   SELECT
+  --     DISTINCT
+  --     DATE_TRUNC(fecha, MONTH) AS fecha,
+
+  --     COUNT(DISTINCT IF(v_inventario_p_e IS NOT NULL, nid, NULL)) AS v_inventario_p_e, # Este es el conteo general del inventario de sellers
+  --     COUNT(DISTINCT IF(v_inventario_p_e_tradicional IS NOT NULL, nid, NULL)) AS v_inventario_p_e_tradicional,
+  --     COUNT(DISTINCT IF(v_inventario_p_e_alianzas IS NOT NULL, nid, NULL)) AS v_inventario_p_e_alianzas,
+
+  --     FROM base
+
+  --     WHERE 
+  --       DATE_TRUNC(fecha, MONTH) 
+  --         < DATE_TRUNC(
+  --             COALESCE(v_fecha_escritura, v_fecha_desistidos_sellers, CURRENT_DATE())
+  --             , MONTH)
+  --       -- AND DATE_TRUNC(fecha, MONTH) IN ('2022-06-01','2022-07-01','2022-08-01')
+        
+  --     GROUP BY 1
+
+  --     -- ORDER BY 1 DESC
+  -- )
+
+  --- Este primer subquery va a traer la información necesaria para conocer la información de sellers
+
+  , f1 as (
+    select
+      
+      distinct date_trunc(fecha, month) as mes,
+      * except(
+          fecha
+        , mes
+        , v_inventario_p_e
+        , v_inventario_p_e_tradicional
+        , v_inventario_p_e_alianzas 
+        , v_fecha_promesa
+        , v_fecha_escritura
+        , v_fecha_desistidos_sellers 
+        , v_inventario_e_p      
+        ),
+
+      IF(date_trunc(fecha, month) = date_trunc(v_fecha_promesa, month)
+        , nid
+        , null
+      ) AS nuevo_seller,
+
+      IF(date_trunc(fecha, month) > date_trunc(v_fecha_promesa, month)
+          and date_trunc(fecha, month) < coalesce(v_fecha_escritura, v_fecha_desistidos_sellers,current_date())
+          -- and date_trunc(fecha, month) < date_trunc(current_date(), month)
+        , nid
+        , null
+      ) AS backlog_seller,
+
+      IF(date_trunc(fecha, month) = date_trunc(v_fecha_escritura, month)
+        , nid
+        , null
+      ) AS salida_seller,
+
+      IF(date_trunc(fecha, month) = date_trunc(v_fecha_desistidos_sellers, month)
+        , nid
+        , null
+      ) AS desistidos_seller,
+
+      from base
+      -- where nid = 8939445255
+      --   and v_inventario_p_e is not null
+      
+        WHERE 
+          DATE_TRUNC(fecha, MONTH) 
+            <= DATE_TRUNC(
+                COALESCE(v_fecha_escritura, v_fecha_desistidos_sellers, CURRENT_DATE())
+                , MONTH)
+          -- and nid = 9616620169
+          and v_inventario_p_e is not null
+
+      order by 2 desc, 1 asc
+  )
+
+  --------------------------------------------------- PUBLICACIONES MÉXICO ------------------------------------------------------
+
+  , f2 AS (
+    select
+      
+      distinct date_trunc(fecha, month) as mes,
+      * except(
+          fecha
+        , mes
+        , v_inventario_p_e
+        , v_inventario_p_e_tradicional
+        , v_inventario_p_e_alianzas 
+        , v_fecha_promesa
+        , v_fecha_escritura
+        , v_fecha_desistidos_sellers 
+        , v_inventario_e_p      
+        ),
+
+      IF (DATE_TRUNC(v_fecha_escritura,MONTH) < mes AND mes < COALESCE(fecha_primer_publicacion,CURRENT_DATE()), nid, NULL) AS backlog_publicacion,
+      IF (v_fecha_desistidos_sellers IS NOT NULL AND v_fecha_escritura < v_fecha_desistidos_sellers AND DATE_TRUNC(v_fecha_desistidos_sellers,MONTH)=mes , nid, NULL) AS escriturados_desistidos,
+      IF (DATE_tRUNC(v_fecha_escritura,MONTH)= mes , nid, NULL) AS nuevo_publicacion,
+      IF (DATE_TRUNC(fecha_primer_publicacion,MONTH) = mes , nid, NULL) AS salida_publicacion,
+
+      from base
+      -- where nid = 8939445255
+      --   and v_inventario_p_e is not null
+      
+        WHERE 
+          DATE_TRUNC(fecha, MONTH) 
+            <= DATE_TRUNC(
+                COALESCE(fecha_primer_publicacion,v_fecha_desistidos_sellers,CURRENT_DATE())
+                , MONTH)
+          -- and nid = 17157295896
+          and v_inventario_e_p is not null
+
+      order by 2 desc, 1 asc
+  )
+
+  -- ----------------------------------------------------- BUYER MÉXICO -------------------------------------------------
+
+  , base_nid AS (
+    SELECT 
+        b.mes AS month,
+        bi.nid,
+        SAFE_CAST(bi.fecha_primer_publicacion AS DATE) AS fecha_primer_publicacion,
+        bi.c_habicredit_100
+        FROM (
+          SELECT
+          SAFE_CAST(nid AS INTEGER) AS nid, 
+          c_habicredit_100 AS c_habicredit_100,
+          CASE 
+            WHEN fecha_primer_publicacion > 
+              (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END) THEN (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END)
+            WHEN fecha_primer_publicacion <= 
+              (CASE 
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+                WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+              END) THEN fecha_primer_publicacion
+            ELSE fecha_primer_publicacion
+          END AS fecha_primer_publicacion,
+          CASE 
+            WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) = mes_cierre THEN DATE(c_fecha_promesa)
+            WHEN DATE_TRUNC(DATE(c_fecha_promesa),month) > mes_cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_promesa,MONTH),INTERVAL 1 DAY)
+          END AS c_fecha_promesa,
+          c_fecha_escritura AS c_fecha_escritura,
+          FROM `papyrus-delivery-data.corp_gov_global.base_inventario_corpfin`
+          WHERE pais='México'
+        ) AS bi
+        
+        CROSS JOIN (
+          SELECT
+          DATE_TRUNC(f.fecha,MONTH) AS mes,
+          f.fecha,
+          FROM `papyrus-data.habi_wh.fechas` AS f
+        ) AS b
+
+        WHERE b.mes >= DATE_tRUNC(bi.fecha_primer_publicacion,MONTH)
+          AND b.mes <= DATE_TRUNC(IFNULL(bi.c_fecha_escritura,CURRENT_DATE()),MONTH)
+        -- AND bi.nid=12930369307
+        GROUP BY 1,2,3,4
+  ),
+
+  promesas_buyers AS (
+    SELECT
+    nid,
+    CASE 
+      WHEN DATE_TRUNC(DATE(c_fecha_finalizado),month) = Mes_Cierre THEN DATE(c_fecha_finalizado)
+      WHEN DATE_TRUNC(DATE(c_fecha_finalizado),month) > Mes_Cierre THEN DATE_SUB(DATE_TRUNC(c_fecha_finalizado,MONTH),INTERVAL 1 DAY)
+    END AS c_fecha_promesa
+    FROM `papyrus-master.operations_habi_mx_buyers.funnel_buyers_mx`
+    WHERE 1=1
+    -- AND c_fecha_finalizado IS NOT NULL
+    AND c_tipo_inventario = 'ibuyer'
+    AND c_status IN ('Venta 1','Desistido')
+    -- AND nid=13060090910
+  ),
+
+  dictamen_buyers AS (
+    SELECT
+    nid,
+    DATE(dct_fecha_venta_2) AS fecha_dictamen,
+    FROM `papyrus-master.operations_habi_mx_buyers.funnel_buyers_mx`
+    WHERE 1=1
+    -- AND nid=10034809199
+    AND dct_fecha_venta_2 IS NOT NULL
+    AND c_tipo_inventario = 'ibuyer'
+    AND tb_status IN ('Venta 2','Venta 1','Revisar','En fila','Titulado','En Proceso','Escriturado','Expediente Completo')
+  ),
+
+  asignacion_tramites AS (
+    SELECT
+    nid,
+    DATE(fecha_de_asiganci_n_de_expediente) AS fecha_asignacion_tramites,
+    FROM `papyrus-master.operations_habi_mx_buyers.int_tramites_buyers`
+    WHERE 1=1 
+    AND tipo_inventario = 'ibuyer'
+    AND fecha_de_asiganci_n_de_expediente IS NOT NULL
+  ),
+
+  desistidos AS (
+    SELECT
+    nid,
+    COALESCE(DATE(tb_fecha_desistimiento),DATE(dct_fecha_desistimiento),DATE(c_fecha_desistimiento)) AS c_fecha_desistimiento,
+    FROM `papyrus-master.operations_habi_mx_buyers.funnel_buyers_mx`
+    WHERE 1=1
+    -- AND nid=10034809199
+    AND c_fecha_desistimiento IS NOT NULL
+    AND c_tipo_inventario = 'ibuyer'
+    AND c_status IN ('Venta 1','Desistido')
+  ),
+
+  escrituras AS (
+    SELECT
+    nid,
+    DATE(tb_fecha_escriturado) AS c_fecha_escritura,
+    FROM `papyrus-master.operations_habi_mx_buyers.funnel_buyers_mx`
+    WHERE 1=1
+    -- AND nid=10034809199
+    AND tb_fecha_escriturado IS NOT NULL
+    AND c_tipo_inventario = 'ibuyer'
+    AND tb_status IN ('Venta 2','Venta 1','Revisar','En fila','Titulado','En Proceso','Escriturado','Expediente Completo')
+  )
+
+  , cross_desistidos AS (
+    SELECT
+      d.nid,
+      month,
+      d.c_fecha_desistimiento,
+    FROM base_nid b
+    CROSS JOIN desistidos d
+    WHERE 1=1
+    AND month >= DATE_tRUNC(c_fecha_desistimiento,MONTH)
+    -- AND b.nid=10034809199
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.nid,month ORDER BY month,d.c_fecha_desistimiento DESC)=1
+  )
+
+  , cross_promesas AS (
+    SELECT
+      d.nid,
+      month,
+      d.c_fecha_promesa,
+    FROM base_nid b
+    CROSS JOIN promesas_buyers d
+    WHERE 1=1
+    AND month >= DATE_tRUNC(c_fecha_promesa,MONTH)
+    -- AND d.nid=8469243954
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.nid,month ORDER BY month,d.c_fecha_promesa DESC)=1
+  )
+
+  , cross_escrituras AS (
+    SELECT
+      d.nid,
+      month,
+      d.c_fecha_escritura,
+    FROM base_nid b
+    CROSS JOIN escrituras d
+    WHERE 1=1
+    AND month >= DATE_tRUNC(c_fecha_escritura,MONTH)
+    -- AND d.nid=8469243954
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.nid,month ORDER BY month,d.c_fecha_escritura DESC)=1
+  )
+
+  , cross_dictamen AS (
+    SELECT
+      d.nid,
+      month,
+      d.fecha_dictamen,
+    FROM base_nid b
+    CROSS JOIN dictamen_buyers d
+    WHERE 1=1
+    AND month >= DATE_tRUNC(d.fecha_dictamen,MONTH)
+    -- AND d.nid=8469243954
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.nid,month ORDER BY month,d.fecha_dictamen DESC)=1
+  )
+
+  , cross_asignacion_tramites AS (
+    SELECT
+      d.nid,
+      month,
+      d.fecha_asignacion_tramites,
+    FROM base_nid b
+    CROSS JOIN asignacion_tramites d
+    WHERE 1=1
+    AND month >= DATE_tRUNC(d.fecha_asignacion_tramites,MONTH)
+    -- AND d.nid=8469243954
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.nid,month ORDER BY month,d.fecha_asignacion_tramites DESC)=1
+  )
+
+  , f3 AS (
+    SELECT
+    bn.month,
+    bn.nid,
+    bn.c_habicredit_100,
+    bn.fecha_primer_publicacion,
+    cp.c_fecha_promesa,
+    cd.c_fecha_desistimiento,
+    ce.c_fecha_escritura,
+
+    IF(DATE_TRUNC(fecha_primer_publicacion,MONTH) = bn.month
+    , bn.nid
+    , NULL) AS nuevo_buyer,
+  
+    IF(bn.month = b.fecha_disponible AND b.tipo_publicacion = 'Inicio mes'
+      AND bn.month > bn.fecha_primer_publicacion
+      , bn.nid
+      , NULL) AS backlog_buyer,
+
+    IF(bn.month = DATE_TRUNC(c.fecha_disponible,MONTH) AND c.tipo_publicacion = 'Republicados'
+      , bn.nid
+      , NULL) AS republicados_buyer,
+
+    IF(DATE_TRUNC(c_fecha_promesa,MONTH) = bn.month
+      , bn.nid
+      ,NULL) AS salida_buyer,
+
+    IF(DATE_tRUNC(c_fecha_desistimiento,MONTH) = bn.month 
+      , bn.nid
+      , NULL) AS desistidos_buyer,
+    
+    IF(DATE_TRUNC(c_fecha_promesa,MONTH) = bn.month
+      , bn.nid
+      ,NULL) AS nuevo_dictamen_buyer,
+
+    IF (c_fecha_promesa < bn.month AND (cdc.fecha_dictamen IS NULL OR cdc.fecha_dictamen >=bn.month)
+      , bn.nid
+      , NULL) AS backlog_dictamen_buyer,
+
+    IF(DATE_TRUNC(cdc.fecha_dictamen,MONTH) = bn.month
+      , bn.nid
+      ,NULL) AS salida_dictamen,
+
+    IF (cdc.fecha_dictamen < bn.month AND (c_fecha_escritura IS NULL OR c_fecha_escritura >=bn.month)
+      , bn.nid
+      , NULL) AS backlog_tramites_buyer,
+
+    IF(DATE_TRUNC(c_fecha_escritura,MONTH) = bn.month
+      , bn.nid
+      ,NULL) AS salida_tramites_buyer
+
+    FROM base_nid AS bn 
+    LEFT JOIN cross_promesas AS cp ON cp.nid=bn.nid AND bn.month=cp.month
+    LEFT JOIN cross_desistidos AS cd ON cd.nid=bn.nid AND cd.month=bn.month
+    LEFT JOIN cross_escrituras AS ce ON ce.nid=bn.nid AND ce.month=bn.month
+    LEFT JOIN cross_asignacion_tramites AS ca ON ca.nid=bn.nid AND ca.month=bn.month
+    LEFT JOIN cross_dictamen AS cdc ON cdc.nid=bn.nid AND cdc.month=bn.month
+    LEFT JOIN (
+      SELECT 
+        nid,
+        fecha_disponible,
+        tipo_publicacion,
+      FROM `papyrus-delivery-data.operations_habi_global_brokers.inventario_mensual`
+      WHERE pais='México'
+        AND tipo_publicacion IN ('Inicio mes')
+        AND producto='iBuyer'
+    ) AS b ON b.nid=bn.nid AND bn.month=b.fecha_disponible
+    LEFT JOIN (
+      SELECT 
+        nid,
+        fecha_disponible,
+        tipo_publicacion,
+      FROM `papyrus-delivery-data.operations_habi_global_brokers.inventario_mensual`
+      WHERE pais='México'
+        AND tipo_publicacion IN ('Republicados')
+        AND producto='iBuyer'
+    ) AS c ON c.nid=bn.nid AND bn.month=DATE_TRUNC(c.fecha_disponible,MONTH)
+    -- WHERE bn.nid=13060090910
+    ORDER BY 1 ASC
+  )
+
+  SELECT
+    f.month,
+    f.nid,
+    f.v_tipo_compra_sellers,
+    f.c_habicredit_100,
+    f1.nuevo_seller,
+    f1.backlog_seller,
+    f1.salida_seller,
+    f1.desistidos_seller,
+    f2.nuevo_publicacion,
+    f2.backlog_publicacion,
+    f2.salida_publicacion,
+    f2.escriturados_desistidos,
+    f3.nuevo_buyer,
+    f3.backlog_buyer,
+    f3.republicados_buyer,
+    f3.salida_buyer,
+    f3.desistidos_buyer,
+    f3.nuevo_dictamen_buyer,
+    f3.backlog_dictamen_buyer,
+    f3.salida_dictamen,
+    f3.backlog_tramites_buyer,
+    f3.salida_tramites_buyer
+
+  FROM fechas AS f
+  LEFT JOIN f1 ON f1.mes=f.month AND f1.nid=f.nid
+  LEFT JOIN f2 ON f2.mes=f.month AND f.nid=f2.nid
+  LEFT JOIN f3 ON f3.month=f.month AND f3.nid=f.nid
+  WHERE 1=1 
+  -- AND f.month='2024-04-01'
+  AND f.nid = 10094503196
+  -- AND republicados_buyer IS NOT NULL
+  ORDER BY 2 DESC , 1 ASC
